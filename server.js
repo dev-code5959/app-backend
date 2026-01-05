@@ -3,7 +3,6 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const adminNoticesRoute = require("./routes/adminNotices");
-const cron = require("node-cron");
 const User = require("./models/User");
 const Settings = require("./models/Settings");
 
@@ -28,49 +27,36 @@ app.options(/.*/, cors());
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
+// Note: uploads directory content will not persist in Vercel serverless functions
 app.use("/uploads", express.static("uploads"));
 
 
-
-let isConneted = false
+let isConnected = false;
 async function connectToDatabase() {
-  if (isConneted) return;
+  if (isConnected) return;
   try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-
-    isConneted = true;
+    const db = await mongoose.connect(process.env.MONGO_URI);
+    isConnected = db.connections[0].readyState;
     console.log("✅ MongoDB connected");
   } catch (error) {
-    console.error("❌ MongoDB connection error:", err.message);
-
+    console.error("❌ MongoDB connection error:", error.message);
+    throw error; // Propagate error so middleware can handle it
   }
 }
 
-// middleware
-app.use((req, res, next) => {
-  if (!isConneted) {
-    connectToDatabase()
+// Database Connection Middleware
+// Ensures DB is connected before handling any request
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    res.status(500).json({
+      message: "Database connection failed",
+      error: error.message
+    });
   }
-  next()
-})
-
-/* ===============================
-   DATABASE CONNECTION
-================================ */
-// mongoose
-//   .connect(process.env.MONGO_URI, {
-//     autoIndex: true
-//   })
-//   .then(() => {
-//     console.log("✅ MongoDB connected");
-//   })
-//   .catch((err) => {
-//     console.error("❌ MongoDB connection error:", err.message);
-//     process.exit(1);
-//   });
+});
 
 /* ===============================
    ROUTES
@@ -95,6 +81,39 @@ app.use("/api/packages", require("./routes/packageRoutes"));
 app.use("/api/admin/notices", adminNoticesRoute);
 
 /* ===============================
+   CRON JOBS (Vercel Compatible)
+================================ */
+// Vercel uses HTTP requests to trigger cron jobs. 
+// This endpoint correlates to the reset logic.
+app.get("/api/cron/daily-reset", async (req, res) => {
+  // secure this endpoint if needed, e.g., check for a secret header
+  try {
+    await User.updateMany(
+      {},
+      {
+        $set: {
+          "tasks.completedToday": 0,
+          "tasks.completedTaskIds": [],
+          "tasks.lastReset": new Date(),
+        },
+      }
+    );
+
+    const settings = await Settings.findOne();
+    if (settings) {
+      settings.lastResetAt = new Date();
+      await settings.save();
+    }
+    console.log("✅ Daily tasks auto reset executed");
+    res.status(200).json({ success: true, message: "Daily tasks reset" });
+  } catch (error) {
+    console.error("❌ Daily reset error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+/* ===============================
    404 HANDLER
 ================================ */
 app.use((req, res) => {
@@ -114,41 +133,16 @@ app.use((err, req, res, next) => {
   });
 });
 
-const startDailyTaskResetJob = require("./jobs/dailyTaskReset");
-startDailyTaskResetJob();
-
-
-cron.schedule(
-  "0 0 * * *",
-  async () => {
-    await User.updateMany(
-      {},
-      {
-        $set: {
-          "tasks.completedToday": 0,
-          "tasks.completedTaskIds": [],
-          "tasks.lastReset": new Date(),
-        },
-      }
-    );
-
-    const settings = await Settings.findOne();
-    if (settings) {
-      settings.lastResetAt = new Date();
-      await settings.save();
-    }
-    console.log("✅ Daily tasks auto reset (Asia/Dhaka)");
-  },
-  { timezone: "Asia/Dhaka" }
-);
-
 /* ===============================
    SERVER START
 ================================ */
-// const PORT = process.env.PORT || 5000;
-
-// app.listen(PORT, () => {
-//   console.log(`🚀 Server running on http://localhost:${PORT}`);
-// });
+// Only listen if the file is run directly (not imported by Vercel)
+if (require.main === module) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, async () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    await connectToDatabase();
+  });
+}
 
 module.exports = app;
